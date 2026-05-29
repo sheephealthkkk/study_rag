@@ -286,7 +286,7 @@ LlamaIndex 将一个完整的 RAG 流程抽象为六个阶段，每个阶段有�
   │   → 两者混用
   │     LlamaIndex 负责：文档加载 → 索引构建 → 检索
   │     LangChain 负责：对话管理 → Agent 调度 → 工具编排
-  │     两者有官方集成，LlamaIndex 的 QueryEngine 可以封装为 LangChain Tool
+  │     两者有官方集成，LlamaIndex 的 QueryEngine 还有很多组件都可以封装为 LangChain Tool
   │
   └─ 快速原型验证 / 小规模知识库
       → LlamaIndex

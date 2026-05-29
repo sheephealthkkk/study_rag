@@ -51,197 +51,501 @@
 
 ### 2.2 Retriever 深度拆解 —— 检索器的统一抽象、工厂模式与具体实现
 
-Retriever 是 LlamaIndex 检索体系的核心抽象层。它解决了一个关键设计问题：**你不需要知道底层是用向量、关键词还是知识图谱做检索——调用方式完全一样。**
+#### 2.2.1 设计动机：为什么需要"统一抽象"
 
-#### 2.2.1 BaseRetriever —— 统一接口解决的问题
+LlamaIndex 中的 Retriever 就是个"万能遥控器"。无论底层用的是向量相似度、BM25 关键词匹配、知识图谱遍历还是树形层级搜索，调用方只需要一个动作：`retriever.retrieve("用户问题")`。
 
-```
-  没有统一接口时 (各检索器各自为政):
+**统一抽象解决的核心痛点：**
 
-    向量检索:  vector_store.search(query_vec, k=5)         ← 需要把Query先向量化
-    关键词检索: bm25_index.search(query_tokens, k=5)       ← 需要把Query先分词
-    图谱检索:  kg_index.query_entities(entities, k=5)      ← 需要先做NER提取实体
+在实际的 RAG 项目中，一个知识库可能同时需要多种检索方式——语义查询用向量检索、精确编码用关键词检索、实体关系用知识图谱检索。**如果没有统一接口，每切换一种检索方式，你就要改写调用的每一行代码。** 这是一种"代码腐烂"——检索逻辑和业务逻辑紧紧地耦合在一起。
 
-    → 每种检索器的调用方式不同，换一个检索器就要重写调用代码
+> **Java 程序员的直觉类比：** `BaseRetriever` 相当于 `java.sql.Connection` 接口。无论底层是 MySQL、PostgreSQL 还是 Oracle，你调用的 `connection.prepareStatement(sql)` 都是一样的。JDBC 驱动程序帮你处理了所有"方言翻译"——BaseRetriever 也是一样，向量检索、关键词检索、图谱检索各有自己的"驱动"，但它们向上暴露的接口完全一致。这就是经典的**策略模式（Strategy Pattern）**——封装一系列可互换的算法，让调用方与实现细节解耦。
 
-  有了 BaseRetriever 统一接口后:
+**没有统一接口时的三个痛点：**
 
-    vector_retriever.retrieve("请假规定")     ← 内部自己处理向量化
-    bm25_retriever.retrieve("请假规定")       ← 内部自己处理分词
-    kg_retriever.retrieve("请假规定")         ← 内部自己处理NER
+| 痛点 | 表现 | 统一接口如何解决 |
+|------|------|-----------------|
+| **调用方式不一致** | 向量检索需要先 Embedding 再调 `vector_store.search()`；BM25 需要先分词再调 `bm25_index.search()`；图谱检索需要先 NER 再调 `kg_index.query()` | 所有检索器统一为 `retriever.retrieve(str)`，内部各自处理预处理逻辑 |
+| **切换成本高** | 从向量检索换成混合检索 → 改调用代码 → 改参数传递 → 改结果处理 → 全链路改动 | 换一个 Retriever 实例即可，调用代码零改动 |
+| **无法组合编排** | 想同时调向量+BM25 再融合 → 手写两路调用的编排逻辑 → 每加一路就多一层 if-else | `HybridRetriever` / `RouterRetriever` 可以像套娃一样组合多个子检索器 |
 
-    → 所有检索器的调用方式完全一样，可以任意替换
-    → 这就是"面向接口编程"的力量
-```
+---
 
-**BaseRetriever 定义的契约：**
+#### 2.2.2 BaseRetriever 契约：所有检索器必须遵守的"合同"
+
+`BaseRetriever` 是一个抽象基类，它定义了两个层次的方法——**给外部调用的公开方法** 和 **给子类实现的内部方法**。
+
+**对外契约（调用方看到的）：**
 
 ```python
-# BaseRetriever 的核心方法 (简化):
+from llama_index.core.retrievers import BaseRetriever
+from llama_index.core.schema import QueryBundle, NodeWithScore
+from typing import List
+
+# ── BaseRetriever 的核心契约（简化版）──
 class BaseRetriever:
-    def retrieve(self, str_or_query_bundle: str, **kwargs) -> List[NodeWithScore]:
-        """同步检索。输入查询字符串，返回带分数的Node列表。"""
-        pass
+    """所有检索器的抽象父类。定义了统一的检索入口。"""
 
-    async def aretrieve(self, str_or_query_bundle: str, **kwargs) -> List[NodeWithScore]:
-        """异步检索。不阻塞事件循环。"""
-        pass
+    def retrieve(
+        self, str_or_query_bundle: str | QueryBundle, **kwargs
+    ) -> List[NodeWithScore]:
+        """
+        同步检索 —— 输入自然语言字符串或 QueryBundle，返回带分数的 Node 列表。
 
-    # 所有子类必须实现 _retrieve (内部方法)，retrieve 会自动处理:
-    #   1. 将 str 转为 QueryBundle (包含 embedding + query_str)
-    #   2. 调用 callback_manager 触发检索事件
-    #   3. 调用子类的 _retrieve 方法
-    #   4. 将结果包装为 NodeWithScore 列表
+        如果传入的是 str：
+          ① 内部自动将其包装为 QueryBundle（包含 query_str + embedding）
+          ② 通过 callback_manager 触发 on_retrieve_start 事件
+          ③ 调用子类的 _retrieve() 方法
+          ④ 通过 callback_manager 触发 on_retrieve_end 事件
+          ⑤ 返回 List[NodeWithScore]
+
+        如果传入的是 QueryBundle：
+          跳过步骤①，直接进入②~⑤（你已预先准备好 embedding，省一次 API 调用）
+        """
+        ...
+
+    async def aretrieve(
+        self, str_or_query_bundle: str | QueryBundle, **kwargs
+    ) -> List[NodeWithScore]:
+        """异步检索 —— 不阻塞事件循环，适合 FastAPI / asyncio 环境。"""
+        ...
 ```
 
-**NodeWithScore 的结构：**
+**对内契约（子类必须实现的）：**
 
 ```python
+    # ── 子类只需要覆写这一个方法 ──
+    def _retrieve(self, query_bundle: QueryBundle) -> List[NodeWithScore]:
+        """
+        子类的核心检索逻辑。
+
+        每种检索器覆写此方法来实现自己的检索行为：
+          VectorIndexRetriever   → Query Embedding → ANN 检索 → Top-K
+          BM25Retriever          → Query 分词 → 倒排索引 → BM25 打分 → Top-K
+          KnowledgeGraphRetriever → Query NER → 图谱遍历 → 相关子图
+
+        注意：子类不需要处理 callback（父类已处理），不需要处理 str→QueryBundle 转换（父类已处理）。
+        子类只需要专注于"拿到 QueryBundle，返回 List[NodeWithScore]"。
+        """
+        raise NotImplementedError
+```
+
+**两个关键设计决策：**
+
+1. **为什么用 `_retrieve`（前缀下划线）而不是直接覆写 `retrieve`？**  
+   这是**模板方法模式（Template Method）**——父类的 `retrieve()` 定义了一套固定流程（包装 Query → 触发回调 → 调用 `_retrieve` → 触发回调 → 返回结果），子类只需要填充"真正做检索"的部分。这保证了所有检索器都经过相同的监控和事件追踪管线，不会遗漏。
+
+2. **为什么 `retrieve` 接受 `str | QueryBundle`？**  
+   你可以直接传一个字符串（最简单），也可以传一个预先算好了 Embedding 的 `QueryBundle`。后者让你在需要自己控制 Embedding 时机（如批量查询、缓存复用）时不被框架限制。
+
+**NodeWithScore —— 检索结果的"通用货币"：**
+
+```python
+from llama_index.core.schema import NodeWithScore, BaseNode
+
+# NodeWithScore = Node + 相关性分数
+# 所有 Retriever 返回的结果都是这个类型，不管底层是什么检索方式
 class NodeWithScore:
-    node: BaseNode          # Node 对象 (text + metadata + relationships)
-    score: Optional[float]  # 相似度分数 (余弦值 or BM25分 or RRF融合分)
-                            # score 的含义取决于检索器类型
-                            # 对向量检索: score = 余弦相似度 [0, 1]
-                            # 对 BM25:     score = BM25 分数 [0, ∞)
-                            # 对 RRF:      score = RRF 融合分 [0, 0.03左右]
+    node: BaseNode           # Node 对象（text + metadata + relationships）
+    score: Optional[float]   # 相关性分数
+                             # 向量检索: 余弦相似度，范围 [0, 1]
+                             # BM25:     词频统计分，范围 [0, ∞)
+                             # RRF 融合:  排名融合分，范围 [0, ~0.03]
+                             # 知识图谱:  实体匹配分，范围 [0, 1]
 ```
 
-#### 2.2.2 as_retriever() —— 工厂方法的完整解析
+> **Java 类比：** `NodeWithScore` 就像 `Map.Entry<K, V>`——它是检索结果的标准包装。不管你的 `HashMap`、`TreeMap` 还是 `LinkedHashMap`，遍历出来的都是 `Map.Entry`。同理，不管你的检索器是什么类型，返回的都是 `List<NodeWithScore>`。
 
-`index.as_retriever()` 是实际开发中最常用的获取 Retriever 的方式。它的本质是一个**工厂方法**——根据 Index 的类型自动选择对应的 Retriever 类，并把 Index 的组件注入进去。
+---
 
-**四步完整流程：**
+#### 2.2.3 as_retriever() 工厂方法：从索引到检索器的一键转换
+
+**问题：** 我们已经有了一个建好的 `VectorStoreIndex` 对象（里面包含了向量库连接、Embedding 模型、Node 存储等一切组件），怎么从这个索引拿到一个能用的检索器？
+
+**最笨的方法（不要这样做）：** 手动从 Index 中取出 `_vector_store`、`_embed_model`、`_docstore` 等内部组件，再手动传给 `VectorIndexRetriever` 的构造函数。这需要你知道 Index 的内部字段名、了解 Retriever 构造函数的参数列表，而且换一种 Index 类型（如从 VectorStoreIndex 换到 TreeIndex）整套代码就废了。
+
+**LlamaIndex 的解法——`as_retriever()` 工厂方法：**
+
+`index.as_retriever()` 一行代码完成上面的全部手工操作。它的内部做了四件事，每一步都是自动化的：
+
+**Step 1 —— 提取组件的"自我介绍"：** Index 对象内部持有向量库连接（`_vector_store`）、Node 存储（`_docstore`）、Embedding 模型（`_embed_model`）和事件追踪器（`_callback_manager`）。`as_retriever()` 把这些组件全部提取出来——对调用方完全透明，你不需要知道字段名。
+
+**Step 2 —— 按 Index 类型"分班"（延迟导入）：** 
 
 ```
-  Step 1: 提取 Index 的内部组件
-  ┌─────────────────────────────────────────────────────────────┐
-  │  VectorStoreIndex 持有以下组件:                               │
-  │    · self._vector_store   → 向量数据库连接                    │
-  │    · self._docstore       → Node 文本/元数据存储              │
-  │    · self._index_store    → 索引元数据存储                    │
-  │    · self._embed_model    → Settings.embed_model (全局)      │
-  │    · self._callback_manager → 事件追踪器                     │
-  │                                                             │
-  │  as_retriever() 把这些组件全部提取出来                          │
-  └─────────────────────────────────────────────────────────────┘
-
-  Step 2: 延迟导入对应的 Retriever 类
-  ┌─────────────────────────────────────────────────────────────┐
-  │  根据 Index 的类型选择:                                       │
-  │    VectorStoreIndex      → VectorIndexRetriever              │
-  │    SummaryIndex           → SummaryIndexRetriever             │
-  │    TreeIndex              → TreeIndexRetriever                │
-  │    KeywordTableIndex      → KeywordTableRetriever             │
-  │    KnowledgeGraphIndex    → KnowledgeGraphRAGRetriever        │
-  │                                                             │
-  │  为什么是"延迟导入": 避免循环依赖。只有调用了 as_retriever()     │
-  │  才会 import 具体的 Retriever 类。                              │
-  └─────────────────────────────────────────────────────────────┘
-
-  Step 3: 依赖注入 —— 把 Index 的组件传给 Retriever 构造器
-  ┌─────────────────────────────────────────────────────────────┐
-  │  VectorIndexRetriever 构造器需要:                              │
-  │    index          ← self (Index 实例本身)                    │
-  │    vector_store   ← self._vector_store                      │
-  │    embed_model    ← self._embed_model                       │
-  │    docstore       ← self._docstore                          │
-  │    callback_manager ← self._callback_manager                │
-  │                                                             │
-  │  Retriever.retrieve() 内部:                                   │
-  │    1. 用 embed_model 将 Query 向量化                          │
-  │    2. 用 vector_store 在向量库中检索                           │
-  │    3. 用 docstore 将检索到的 ID 映射回 Node 对象              │
-  │    4. 用 callback_manager 触发事件 (用于监控和追踪)            │
-  └─────────────────────────────────────────────────────────────┘
-
-  Step 4: 传递 **kwargs —— 让调用方控制检索行为
-  ┌─────────────────────────────────────────────────────────────┐
-  │  similarity_top_k=5    → Retriever 每次检索返回几个结果        │
-  │  alpha=0.5             → 混合检索权重 (0=纯BM25, 1=纯向量)    │
-  │  filters=MetadataFilters(...) → 元数据过滤条件                │
-  │  node_ids=[id1, id2]   → 限定只在指定 Node 中检索             │
-  └─────────────────────────────────────────────────────────────┘
+你创建的 Index 类型  →  as_retriever() 自动选择的 Retriever 类
+────────────────────────────────────────────────────────
+VectorStoreIndex      →  VectorIndexRetriever       （向量相似度检索）
+SummaryIndex          →  SummaryIndexRetriever      （摘要索引检索）
+TreeIndex             →  TreeIndexRetriever         （树形层次检索）
+KeywordTableIndex     →  KeywordTableRetriever      （关键词倒排查检索）
+KnowledgeGraphIndex   →  KnowledgeGraphRAGRetriever （知识图谱检索）
 ```
 
-**as_retriever 的三种典型用法：**
+"延迟导入"意味着只有当你真正调用 `as_retriever()` 时，对应的 Retriever 类才会被 import。这避免了模块间的循环依赖——Index 模块不需要在加载时就 import Retriever 模块。
+
+**Step 3 —— 依赖注入：** 将 Step 1 提取的组件"注入"到 Retriever 的构造器中。这就像汽车工厂——底盘（Index 的组件）是一条流水线送过来的，车身（Retriever 的构造器）在另一条流水线上，工厂方法（`as_retriever`）站在中间把它们组装在一起。你不需要亲手拧每一颗螺丝。
+
+**Step 4 —— 透传配置参数：** 你在 `as_retriever(similarity_top_k=5, filters=...)` 中传的参数，会被直接传递到 Retriever 的构造函数中，覆盖默认值。
+
+> **Java 类比：** `as_retriever()` 就像一个 **FactoryBean**。Spring 容器中的 `SqlSessionFactoryBean` 会自动读取数据源配置、MyBatis 映射文件、插件列表等"组件"，生成一个可直接使用的 `SqlSession`。你不需要手动拼装这些组件——工厂方法帮你做了依赖注入。
+
+**as_retriever() 三种常用范式：**
 
 ```python
 from llama_index.core import VectorStoreIndex
 from llama_index.core.vector_stores import MetadataFilter, MetadataFilters
 
 # ═══════════════════════════════════════════════════════════════
-# 用法 1: 最简原型 —— 只设 top_k
+# 范式 1: 最简原型 —— 只指定返回数量
 # ═══════════════════════════════════════════════════════════════
 retriever = index.as_retriever(similarity_top_k=5)
 nodes = retriever.retrieve("事假需要提前多久申请？")
-# 适用: 刚跑通流程，还没调参数
+# 适用于：刚搭好 RAG 原型，还没开始调参
 
 # ═══════════════════════════════════════════════════════════════
-# 用法 2: 元数据过滤 —— 限定检索范围
+# 范式 2: 元数据过滤 —— 限定检索范围（生产环境标配）
 # ═══════════════════════════════════════════════════════════════
 filters = MetadataFilters(filters=[
-    MetadataFilter(key="status", value="active"),
-    MetadataFilter(key="version", value="V3.0"),
+    MetadataFilter(key="status", value="active"),     # 只查生效中的
+    MetadataFilter(key="version", value="V3.0"),      # 只要 V3.0 版本
 ])
 retriever = index.as_retriever(
-    similarity_top_k=10,    # 在过滤后的子集中取 Top-10
+    similarity_top_k=10,  # 在过滤后的子集中取 Top-10
     filters=filters,
 )
-# 适用: 只查当前生效的 V3.0 政策，排除旧版本和草稿
+# 适用于：排除旧版本和草稿，只检索当前生效的政策
 
 # ═══════════════════════════════════════════════════════════════
-# 用法 3: 配合 Reranker —— 粗排 + 精排
+# 范式 3: 配合 Reranker —— 粗排多捞 + 精排精选（高精度场景）
 # ═══════════════════════════════════════════════════════════════
 from llama_index.core.postprocessor import SentenceTransformerRerank
 
-# 粗排: 取 30 个候选 (高召回)
+# 粗排阶段：取 30 个候选（宁可多捞，不能漏掉正确答案）
 retriever = index.as_retriever(similarity_top_k=30)
-# 精排: 用 Cross-Encoder 从 30 个中挑出最好的 3 个
+# 精排阶段：用 Cross-Encoder 从 30 个中挑出最相关的 3 个
 reranker = SentenceTransformerRerank(
     model="BAAI/bge-reranker-v2-m3",
     top_n=3,
 )
-
 query_engine = index.as_query_engine(
     retriever=retriever,
     node_postprocessors=[reranker],
 )
-# 适用: 生产环境，追求高精度
+# 适用于：对检索精度要求高的生产环境
 ```
 
-**as_retriever 适合与不适合的场景：**
+---
 
-| 适合 | 不适合 |
-|------|--------|
-| 快速原型——一行代码拿到检索器 | 需要 BM25 检索——as_retriever 默认是向量检索 |
-| 标准 RAG 查询——默认向量检索足够 | 需要多路检索——需要显式创建 HybridRetriever |
-| 元数据过滤——传入 filters 即可 | 需要精细控制检索参数——显式创建更灵活 |
-| 配合 Reranker——设大 top_k 做粗排 | 需要自定义检索逻辑——显式创建 |
+#### 2.2.4 显式创建检索器：突破工厂方法的限制
 
-#### 2.2.3 显式创建检索器 —— 完全自由的控制
+`as_retriever()` 解决 80% 的场景，但当你需要**精细控制检索底层行为**时，直接通过构造函数创建检索器是唯一的途径。两者的本质区别在于"控制力的边界"。
+
+**as_retriever() 的控制边界：** 工厂方法只暴露了最常用的参数（`similarity_top_k`、`filters`、`alpha`），内部机制（如检索模式、稀疏检索参数、节点级别控制）被封装了。
+
+**显式创建能做什么 as_retriever() 做不到的：**
 
 ```python
 from llama_index.core.retrievers import VectorIndexRetriever
 
-# 显式创建，可以传入 as_retriever() 不支持的高级参数
 retriever = VectorIndexRetriever(
     index=index,
     similarity_top_k=5,
-    # ── 以下参数 as_retriever 也支持但通过 **kwargs 隐式传递 ──
-    vector_store_query_mode="hybrid",  # "default"(纯向量) / "sparse" / "hybrid"
-                                       # "hybrid" 需要向量库支持混合检索
-    alpha=0.7,          # 混合检索权重: 0.7向量 + 0.3关键词
-    filters=filters,
-    # ── 以下参数 as_retriever 不支持 ──
-    node_ids=["node_001", "node_005"],  # 限定只在这两个 Node 中检索
-    # 这在你只想"在特定章节范围内检索"时非常有用
+
+    # ── ① 向量库原生混合检索（as_retriever 不暴露）──
+    vector_store_query_mode="hybrid",   # "default"(纯向量) | "sparse" | "hybrid"
+                                        # hybrid 需要向量库（如 Milvus 2.4+）原生支持
+    alpha=0.7,                          # 混合权重：0.7 向量 + 0.3 稀疏
+    sparse_top_k=10,                    # 稀疏支路独立返回数
+
+    # ── ② 限定检索范围到特定 Node（as_retriever 不支持）──
+    node_ids=["chapter_section_3", "chapter_section_4"],
+    # 只看这两章的内容 → 适合"只查第三章和第四章"的限定查询
+
+    # ── ③ 覆盖全局 Embedding 模型（as_retriever 不支持）──
+    embed_model=custom_bge_model,
+    # 用不同于建索引时的 Embedding 模型做检索
+    # 警告：必须与建索引时的模型在同一向量空间中（通常仍需同一系列模型）
+)
+```
+
+**两种方式的对比总结：**
+
+| 维度 | `index.as_retriever()` | 显式创建 Retriever |
+|------|----------------------|-------------------|
+| **使用复杂度** | 极低——一行代码 | 中等——需要了解构造参数 |
+| **参数暴露程度** | 常用参数（top_k、filters、alpha） | 全部参数（含 query_mode、node_ids、自定义 embed_model） |
+| **底层控制力** | 低——工厂方法帮你做了决策 | 高——你自己做所有决策 |
+| **适用场景** | 快速原型、标准 RAG 查询、元数据过滤、配合 Reranker | 向量库原生混合检索、限定章节检索、自定义 Embedding、高级参数调试 |
+| **Index 类型切换** | 自动适配（VectorStore→Vector、Tree→Tree...） | 需手动改代码（换 Index 类型 → 换 Retriever 类） |
+| **类比** | Spring Boot 的 `@Autowired`——自动装配、约定大于配置 | Spring 的 `new XmlBeanFactory(...)`——手动装配、完全掌控 |
+
+**选择原则：** 原型和标准场景用 `as_retriever()`——够用且安全。生产环境中遇到 `as_retriever()` 无法满足的需求（混合检索模式、节点级限定、自定义 embed_model），再切换到显式创建。
+
+---
+
+#### 2.2.5 每种 Retriever 的完整用法与适用场景
+
+LlamaIndex 为每种 Index 类型配套了一个专用 Retriever。下面逐一给出完整的 Python 示例和选型指南。
+
+##### ① VectorIndexRetriever —— 向量语义检索（最常用，覆盖 90% 场景）
+
+**通俗定义：** 把 Query 和所有 Chunk 都变成向量，谁的向量方向和 Query 最接近，谁就是最相关的。  
+**适用场景：** 自然语言问题、语义相近但用词不同的查询（"怎么请假"→ 匹配 "事假申请步骤"）。  
+**不适用场景：** 精确编号查询（"ERP-2025-BJ-001"）、罕见专有名词。
+
+```python
+from llama_index.core import VectorStoreIndex
+from llama_index.core.retrievers import VectorIndexRetriever
+
+# ── 先建索引（假设已有 documents）──
+index = VectorStoreIndex.from_documents(documents)
+
+# ── 方式 A：通过工厂方法（推荐日常使用）──
+retriever_a = index.as_retriever(similarity_top_k=5)
+nodes = retriever_a.retrieve("年假怎么算的？")
+
+# ── 方式 B：显式创建（需要精细控制时使用）──
+retriever_b = VectorIndexRetriever(
+    index=index,
+    similarity_top_k=5,            # 返回数量
+    vector_store_query_mode="default",  # "default" | "sparse" | "hybrid"
+    alpha=0.5,                     # 混合检索时有效，0=纯稀疏，1=纯向量
+    filters=MetadataFilters(       # 元数据过滤
+        filters=[MetadataFilter(key="status", value="active")]
+    ),
+)
+nodes = retriever_b.retrieve("年假怎么算的？")
+
+# ── 检索结果的使用 ──
+for node_with_score in nodes:
+    print(f"分数: {node_with_score.score:.3f}")
+    print(f"内容: {node_with_score.node.text[:80]}...")
+    print(f"来源: {node_with_score.node.metadata.get('source')}")
+    print("---")
+```
+
+---
+
+##### ② SummaryIndexRetriever —— 基于摘要的检索
+
+**通俗定义：** 不是对每个 Chunk 建索引，而是先对所有 Node 生成一段摘要，检索时匹配摘要内容。  
+**适用场景：** "全文总结"类查询（"这本手册主要讲了什么？"）、文档级（而非段落级）检索。  
+**与 VectorIndexRetriever 的关键区别：** VectorIndexRetriever 返回的是单个 Chunk，SummaryIndexRetriever 可以从多个 Node 中综合出答案。
+
+```python
+from llama_index.core import SummaryIndex
+from llama_index.core.retrievers import SummaryIndexRetriever
+
+# ── 构建摘要索引 ──
+summary_index = SummaryIndex.from_documents(documents)
+
+# ── 工厂方式获取检索器 ──
+retriever = summary_index.as_retriever(similarity_top_k=5)
+nodes = retriever.retrieve("员工手册中关于休假的规定有哪些？")
+# 返回的 Node 是"与 query 相关的文档片段"
+
+# ── SummaryIndex 的一个独特价值：可以用于"全局总结"
+# 当 similarity_top_k 足够大时，LLM 能看到文档的全貌
+query_engine = summary_index.as_query_engine(
+    response_mode="tree_summarize",  # 分层归纳
+    similarity_top_k=20,             # 取足够多的片段供总结
+)
+response = query_engine.query("请总结这本手册的核心内容")
+```
+
+---
+
+##### ③ BM25Retriever —— 关键词/稀疏检索
+
+**通俗定义：** 统计查询中每个词在文档中出现的频率和稀有度，计算相关性分数。  
+**适用场景：** 精确编号（"ERP-2025-BJ-001"）、专有名词、代码片段、中文缩写。  
+**核心优势：** 不需要 Embedding 计算，构建快、检索快、对"精确字符串匹配"的查询效果优于向量检索。
+
+```python
+from llama_index.core.retrievers import BM25Retriever
+from llama_index.core import VectorStoreIndex
+
+# ── 先准备好 Node 列表（从已有的 Index 中获取）──
+index = VectorStoreIndex.from_documents(documents)
+nodes = list(index.docstore.docs.values())  # 取出所有 Node
+
+# ── 构建 BM25 检索器（注意：BM25 不需要 Index，只需要 Node 列表）──
+bm25_retriever = BM25Retriever.from_defaults(
+    nodes=nodes,                # 从这些 Node 构建倒排索引
+    similarity_top_k=10,        # 每次返回 Top-10
+    k1=1.5,                     # 词频饱和参数（默认 1.5）
+    b=0.75,                     # 长度归一化强度（默认 0.75）
 )
 
-# 适用场景:
-#   1. 需要 vector_store_query_mode="hybrid" (向量库原生混合检索)
-#   2. 需要限定特定 node_ids (只查某几个章节)
-#   3. 需要精细控制 alpha 参数
+# ── 对精确编码查询效果极佳 ──
+results = bm25_retriever.retrieve("ERP-2025-BJ-001 审批状态")
+for node in results:
+    print(f"BM25={node.score:.2f} | {node.text[:60]}...")
+
+# ── 也可以在构建时预设过滤 ──
+bm25_retriever_filtered = BM25Retriever.from_defaults(
+    nodes=[n for n in nodes if n.metadata.get("status") == "active"],
+    similarity_top_k=5,
+)
 ```
+
+**关键参数 `k1` 和 `b` 的含义：**
+
+| 参数 | 控制什么 | 默认值 | 调大效果 | 调小效果 |
+|:---:|------|:---:|------|------|
+| **k1** | 词频饱和程度 | 1.5 | 词出现越多→分数越高（线性加分） | 词频饱和快→出现1次和10次分数接近 |
+| **b** | 长文档惩罚强度 | 0.75 | 强力惩罚长文档→短文档更容易排前面 | 不惩罚长文档→长短文档公平竞争 |
+
+---
+
+##### ④ TreeIndexRetriever —— 树形层次检索
+
+**通俗定义：** 将文档构建为一棵树——根节点是全文概要，中间节点是章节摘要，叶子节点是具体的 Chunk。检索时从根节点开始逐层"下钻"。  
+**适用场景：** 有天然层级结构的文档（手册、教科书、法律条文），查询需要"按章节缩小范围"时。
+
+```python
+from llama_index.core import TreeIndex
+from llama_index.core.retrievers import TreeIndexRetriever
+
+# ── 构建树形索引 ──
+# 注意：TreeIndex 在构建时会调用 LLM 来生成每层的摘要节点
+# 构建时间比 VectorStoreIndex 长（需要多次 LLM 调用）
+tree_index = TreeIndex.from_documents(documents)
+
+# ── 获取检索器 ──
+retriever = tree_index.as_retriever(
+    similarity_top_k=5,
+    child_branch_factor=3,  # 每层向下探索几个分支（越大越全面但越慢）
+)
+
+# ── 检索：从根节点开始，逐层找到最相关的叶子节点 ──
+nodes = retriever.retrieve("第三章讲了什么内容？")
+# 树形检索的优势：如果 Query 提到"第三章"，树从根节点直接定位到第三章分支
+
+# ── 注意 ──
+# TreeIndex 的构建成本高（需要 LLM 生成每层摘要），适合文档量 < 1000 份
+# 大规模场景下推荐 VectorStoreIndex + 元数据中的标题层级代替
+```
+
+---
+
+##### ⑤ KnowledgeGraphRAGRetriever —— 知识图谱检索
+
+**通俗定义：** 不是把文档当"一段文字"来搜索，而是先抽取"实体和关系"构建成知识图谱，查询时在图谱中遍历实体之间的路径。  
+**适用场景：** 多跳推理（"张三的直属领导是谁的配偶？"）、实体关系查询（"哪些政策与HR部门相关？"）。
+
+```python
+from llama_index.core import KnowledgeGraphIndex
+from llama_index.core.retrievers import KnowledgeGraphRAGRetriever
+from llama_index.core import StorageContext
+from llama_index.graph_stores.simple import SimpleGraphStore
+
+# ── 构建知识图谱存储 ──
+graph_store = SimpleGraphStore()
+storage_context = StorageContext.from_defaults(graph_store=graph_store)
+
+# ── 构建知识图谱索引（内部会用 LLM 抽取实体和关系三元组）──
+kg_index = KnowledgeGraphIndex.from_documents(
+    documents,
+    storage_context=storage_context,
+    max_triplets_per_chunk=5,     # 每个 Chunk 最多抽取 5 个三元组
+    include_embeddings=True,      # 对实体做 Embedding，辅助语义匹配
+)
+
+# ── 获取检索器 ──
+kg_retriever = kg_index.as_retriever(
+    similarity_top_k=5,
+    include_text=True,            # 是否包含原始文本（true=文本+三元组）
+)
+
+# ── 检索 ──
+nodes = kg_retriever.retrieve("哪位高管负责HR部门？")
+# 知识图谱检索会：
+#   1. 识别 Query 中的实体 "HR部门"
+#   2. 在图谱中查找 HR部门 → [负责人] → ?
+#   3. 返回包含该实体关系的子图和相关 Node
+```
+
+> **注意：** KnowledgeGraphIndex 的构建依赖大量 LLM 调用（每个 Chunk 都要抽取实体和关系），成本显著高于 VectorStoreIndex。适合文档量 < 10,000 份且实体关系查询是核心需求的场景。
+
+---
+
+##### ⑥（高级）RouterRetriever —— 智能路由检索
+
+**通俗定义：** 一个"调度中心"——根据 Query 的特征，自动选择最合适的检索器来处理。  
+**适用场景：** 知识库中有多种类型的索引（向量索引+关键词索引+图谱索引），不同问题适合不同的检索方式。
+
+```python
+from llama_index.core.retrievers import RouterRetriever
+from llama_index.core.selectors import LLMSingleSelector
+
+# ── 准备多个专用检索器 ──
+vector_retriever = vector_index.as_retriever(similarity_top_k=5)
+bm25_retriever = BM25Retriever.from_defaults(nodes=nodes, similarity_top_k=5)
+
+# ── 创建路由检索器 ──
+router_retriever = RouterRetriever.from_defaults(
+    retriever_tools=[
+        # 每个检索器配一个描述——Router 用它判断"该用谁"
+        vector_retriever.as_tool(description=(
+            "适用于自然语言描述的查询，如'年假怎么申请'、'公司福利有哪些'"
+        )),
+        bm25_retriever.as_tool(description=(
+            "适用于精确编码、编号、缩写查询，如'ERP-2025-BJ-001'、'V3.0版本'"
+        )),
+    ],
+    selector=LLMSingleSelector.from_defaults(),  # 用 LLM 做路由判断
+)
+
+# ── Router 自动选择 ──
+nodes = router_retriever.retrieve("ERP-2025-BJ-001 的审批状态")
+# Router 内部：LLM 判断 → "这是精确编号查询" → 路由到 BM25
+```
+
+---
+
+##### ⑦（高级）QueryFusionRetriever —— 多查询融合检索
+
+**通俗定义：** 对同一个用户问题生成多个"语义等价"的查询变体，每个变体独立检索，最后融合所有结果。  
+**适用场景：** 用户问题简短、模糊、有多种理解方式（"请假"→ 可能指事假、年假、病假）。
+
+```python
+from llama_index.core.retrievers import QueryFusionRetriever
+from llama_index.core.retrievers.fusion_retriever import FUSION_MODES
+
+# ── 基础检索器 ──
+base_retriever = index.as_retriever(similarity_top_k=10)
+
+# ── 创建查询融合检索器 ──
+fusion_retriever = QueryFusionRetriever(
+    retrievers=[base_retriever],   # 可以传同一个检索器（用不同 query 跑多次）
+    similarity_top_k=5,            # 融合后最终返回数量
+    num_queries=3,                 # 生成 3 个查询变体
+    mode=FUSION_MODES.RECIPROCAL_RANK,  # RRF 融合
+    use_async=True,                # 并行执行多个查询
+)
+
+# ── 检索 ──
+nodes = fusion_retriever.retrieve("请假")  # 可能生成"事假申请"、"年假规定"、"病假流程"三个变体
+# → 3 个变体各自检索 → 结果 RRF 融合 → Top-5
+```
+
+---
+
+#### 2.2.6 检索器全景对比与选型速查
+
+| 检索器 | 核心原理 | 最适合的查询类型 | 构建成本 | 适用规模 |
+|--------|----------|-----------------|:---:|:---:|
+| **VectorIndexRetriever** | Query/Doc 向量化 → ANN 检索 | 自然语言、同义词、跨语言 | 低 | 十亿级 |
+| **BM25Retriever** | 词频-逆文档频率统计 | 精确编码、专有名词、代码 | 极低 | 十亿级 |
+| **SummaryIndexRetriever** | Node→摘要→匹配摘要 | "全文总结"类、文档级检索 | 中 | 千万级 |
+| **TreeIndexRetriever** | 层级树→逐层下钻 | 按章节缩小范围、层级化查询 | 高（需 LLM） | 万级 |
+| **KnowledgeGraphRAGRetriever** | 实体抽取→图谱遍历 | 多跳推理、实体关系查询 | 极高（需 LLM） | 万级 |
+| **RouterRetriever** | 多检索器+LLM路由 | 混合知识库、不同查询需要不同检索方式 | 中 | 不限 |
+| **QueryFusionRetriever** | 多查询变体+融合 | 短查询、模糊查询 | 中（多轮检索） | 不限 |
+
+**一句话选型指南：** 90% 的场景用 `VectorIndexRetriever` 就够了。遇到精确编号查询 → 加入 `BM25Retriever`。需要多路融合 → 用 `RouterRetriever` 或 `HybridRetriever` 组合它们。只有在文档有天然层级结构或多跳推理需求时，才考虑 TreeIndex 或 KnowledgeGraph。
 
 ---
 
@@ -857,6 +1161,330 @@ for i, src in enumerate(response.source_nodes, 1):
 ═══════════════════════════════════════════════════════════════════════
 ```
 
+
+---
+
+## 2.8 大厂面试题深度讲解
+
+### 2.8.1 Retriever 架构类
+
+#### Q1：LlamaIndex 的 `index.as_retriever()` 内部做了哪些事？为什么它被称为"工厂方法"？（字节跳动 / 腾讯 架构理解题）
+
+**面试官考察点：** 是否真正理解 `as_retriever()` 的内部流程，而不只是会调用 API。
+
+**回答框架——四步内部流程：**
+
+**Step 1——提取 Index 的内部组件：**
+
+```
+VectorStoreIndex 内部持有以下核心组件：
+  · self._vector_store   → 向量数据库连接
+  · self._docstore       → Node 文本/元数据存储（ID → Node 映射）
+  · self._embed_model    → Settings.embed_model（全局 Embedding 模型）
+  · self._callback_manager → 事件追踪器（监控和调试用）
+
+as_retriever() 的第一步就是把这些组件全部提取出来。
+```
+
+**Step 2——延迟导入对应的 Retriever 类（避免循环依赖）：**
+
+```
+根据 Index 类型自动选择 Retriever 实现：
+  VectorStoreIndex      → VectorIndexRetriever
+  SummaryIndex          → SummaryIndexRetriever
+  TreeIndex             → TreeIndexRetriever
+  KeywordTableIndex     → KeywordTableRetriever
+  KnowledgeGraphIndex   → KnowledgeGraphRAGRetriever
+
+为什么是"延迟导入"：只有调用 as_retriever() 时才会 import 对应的 Retriever 类。
+避免模块间循环依赖问题。
+```
+
+**Step 3——依赖注入：**
+
+```
+将 Index 的组件"注入"到 Retriever 构造器中：
+  VectorIndexRetriever(
+    index=index,
+    vector_store=self._vector_store,
+    embed_model=self._embed_model,
+    docstore=self._docstore,
+    ...
+  )
+
+Retriever.retrieve() 内部：
+  ① 用 embed_model 将 Query 向量化
+  ② 用 vector_store 在向量库中做 ANN 检索
+  ③ 用 docstore 将检索到的 ID 映射回 Node 对象
+  ④ 用 callback_manager 触发事件（监控追踪）
+```
+
+**Step 4——传递 **kwargs 让调用方控制行为：**
+
+```
+similarity_top_k=5      → 每次返回几个结果
+alpha=0.5               → 混合检索权重（0=纯BM25, 1=纯向量）
+filters=MetadataFilter  → 元数据过滤条件
+node_ids=[id1, id2]     → 限定特定 Node 中检索
+```
+
+**为什么叫"工厂方法"——面向接口编程的价值：**
+
+```
+工厂方法的三个特征：
+  ① 封装了对象创建的复杂性（你不知道内部选了哪个 Retriever 子类）
+  ② 返回统一的接口（BaseRetriever）→ 调用方不关心底层实现
+  ③ 可以根据输入动态决定返回哪个子类（根据 Index 类型）
+
+价值：调用 retriever.retrieve(query) 的方式完全一样，
+      无论底层是向量检索、BM25 还是知识图谱。
+```
+
+---
+
+#### Q2：`as_retriever()` 和显式创建 `VectorIndexRetriever` 有什么区别？什么时候必须显式创建？（阿里巴巴 / 美团）
+
+**面试官考察点：** "什么时候该深入底层"的工程判断力。
+
+**回答思路（对比例子讲清差异）：**
+
+**as_retriever() 足够用的场景：**
+
+```python
+# 标准 RAG 检索——as_retriever 完全够用
+retriever = index.as_retriever(
+    similarity_top_k=5,
+    filters=MetadataFilters(...)
+)
+nodes = retriever.retrieve("请假规定")
+# 适用：标准向量检索 + 元数据过滤 + 配合 Reranker（设大 top_k）
+```
+
+**必须显式创建的四个场景：**
+
+```python
+# 场景 1：需要混合检索（向量+关键词在向量库层面融合）
+retriever = VectorIndexRetriever(
+    index=index,
+    vector_store_query_mode="hybrid",  # as_retriever 不支持此参数
+    alpha=0.7,  # 70% 向量 + 30% BM25
+)
+
+# 场景 2：需要限定特定 Node ID 范围检索
+retriever = VectorIndexRetriever(
+    index=index,
+    node_ids=["chapter_3_id", "chapter_4_id"],  # 只在这两章中检索
+)
+# as_retriever 不支持 node_ids
+
+# 场景 3：需要精细控制高级检索参数
+retriever = VectorIndexRetriever(
+    index=index,
+    similarity_top_k=20,
+    sparse_top_k=10,       # BM25 支路返回数
+    hybrid_top_k=5,        # 融合后返回数
+    # 这些高级参数 as_retriever 不暴露
+)
+
+# 场景 4：需要覆盖 embed_model（用不同的模型检索）
+retriever = VectorIndexRetriever(
+    index=index,
+    embed_model=custom_embed_model,  # 不同用于建索引的模型
+)
+```
+
+**决策原则：** "原型和标准场景用 `as_retriever()`——一行代码、够用。需要控制向量库底层行为（混合检索模式、高级参数、自定义 embed_model）时，才显式创建。"
+
+---
+
+### 2.8.2 BM25 与混合检索类
+
+#### Q3：BM25 的三个核心参数（k1、b）分别控制什么？什么场景下需要调整默认值？（腾讯 / 百度）
+
+**面试官考察点：** 是否真正理解 BM25 的数学机制及其参数含义。
+
+**回答框架——两个参数的角色与调优场景：**
+
+**k1（词频饱和参数，默认 1.5）——控制"词出现多次还有多少额外加分"：**
+
+```
+k1 的数学作用：TF_norm = f(q,D) / (f(q,D) + k₁ × (...))
+
+k1 → 0：词频几乎不发挥作用，每个词最多 +1 分
+  → "请假"出现 1 次 ≈ "请假"出现 10 次
+  → 适用：不关心词频，只关心"是否包含"
+  
+k1 = 1.5（默认）：适中的词频奖励
+  → "请假"出现 1 次 → 0.4 分，"请假"出现 5 次 → 0.62 分
+  → 适用：大多数场景
+
+k1 → ∞：词频线性加分
+  → "请假"出现 10 次 = 10 × 出现 1 次的分
+  → 适用：词频是强信号的场景（如搜索日志）
+
+调大 k1 当：内容丰富度重要（长文档中反复讨论一个话题=强相关）
+调小 k1 当：文档长度差异大（长文档天然词频高，需要抑制）
+```
+
+**b（长度归一化强度，默认 0.75）——控制"长文档是否受惩罚"：**
+
+```
+b 的数学作用：|D|/avgDL 的系数
+
+b = 0：不惩罚长文档
+  → 5000 字文档和 500 字文档同等对待
+  → 适用：文档长度均匀、长文档不应被降权
+
+b = 0.75（默认）：适度惩罚长文档
+  → 5000 字文档中"请假"出现 3 次 < 500 字中出现 3 次的得分
+  → 适用：大多数场景
+
+b = 1.0：强力惩罚长文档
+  → 长文档需要更高词频才能获得同等得分
+  → 适用：长文档通常质量低（如爬虫抓取的冗长网页）
+
+调大 b 当：长文档通常包含大量无关内容（网页、论坛帖子）
+调小 b 当：长文档通常更全面（技术规范、法律条文）
+```
+
+**面试官追问："中文场景下，BM25 需要分词，分词质量对 BM25 效果影响大吗？"**
+
+"影响非常大。BM25 的 IDF 和 TF 都是基于'词'这个单位的。如果分词错误——比如把'请假申请'分成了'请'和'假申请'——IDF 和 TF 的计算就完全错了。中文 BM25 的一个重要实践是用**细粒度和粗粒度混合分词**——既做单字分词（避免漏匹配），也做词组分词（提升匹配精度）。或者直接用支持中文的 BM25 实现（如 jieba 分词 + rank_bm25 库）。"
+
+---
+
+#### Q4：HybridRetriever 的三种融合模式（RRF / relative_score / simple）各自适用于什么场景？为什么混合向量+BM25 时 RRF 是最推荐的？（字节跳动 / 腾讯）
+
+**面试官考察点：** 三种融合模式的选型判断力。
+
+**回答框架——先对比三者的核心差异，再讲选型逻辑：**
+
+**三种模式的核心差异：**
+
+| | RRF | relative_score | simple |
+|------|:---:|:---:|:---:|
+| 融合理念 | 只看排名 | 归一化分数后加权 | 去重后原始分数排序 |
+| 分数量纲要求 | 不需要一致 | 需要可归一化 | 需要一致 |
+| 异常值抵抗力 | 强（排名不外扩） | 弱（1个极端分数→主导） | 弱 |
+| 可加权 | 否（排名等权重） | 是 | 否 |
+| 适用检索器类型 | 不同类型（向量+BM25） | 同类（多Embedding融合） | 完全同类 |
+
+**为什么混合向量+BM25 时 RRF 最推荐——"量纲不可比"问题的天然解决：**
+
+```
+向量检索的分数：余弦相似度 → [0.3, 0.95]，集中在高端，各结果差异在 0.01-0.03 量级
+BM25 的分数：词频加权 → [0.5, 50+]，差异在 5-10 量级
+
+如果用 relative_score（归一化后加权）：
+  → 需要先算 min/max → 需要扫描全部候选（多一次遍历）
+  → BM25 的极端高分（某文档得分 50+）→ 归一化后 = 1.0
+  → 其他所有文档被压到接近 0 → BM25 单路主导了融合
+
+如果用 RRF：
+  → 只看排名，BM25 第 1 名 = 向量第 1 名 = 同样的贡献
+  → 不需要扫描、不需要归一化、不需要调权重
+  → "两路都排前三"的文档自动胜出 → 降低单路排名波动的风险
+```
+
+**选型原则：**
+
+```
+混合向量+BM25（不同类型检索器）→ RRF（最推荐）
+  理由：分数量纲天然不同，RRF 最稳健
+
+多个不同 Embedding 模型融合 → relative_score
+  理由：同样都是余弦相似度[0,1]，归一化后可公平加权
+  例子：bge-large-zh + m3e-base 双路向量融合
+
+同一检索器不同参数组合 → simple
+  理由：同类型分数可直接比较，不需要融合优化
+  例子：K=20 和 K=30 两路结果合并去重
+```
+
+---
+
+### 2.8.3 ResponseSynthesizer 类
+
+#### Q5：LlamaIndex 的五种 ResponseSynthesizer（Simple/Compact/Refine/Tree Summarize/No Text）各自适用于什么场景？生产环境为什么推荐 Compact 作为默认？（腾讯 / 阿里巴巴 综合题）
+
+**面试官考察点：** 五种策略的差异理解 + 生产默认选择的判断力。
+
+**回答框架——按 Node 数量分层选型：**
+
+**五种策略一句话定位：**
+
+| 策略 | LLM调用 | 延迟 | 质量 | 一句话 |
+|------|:---:|:---:|:---:|------|
+| **Simple** | 1 次 | ~1s | 中 | 全部拼接→一次生成，最快 |
+| **Compact** | 1-2 次 | ~2s | 中高 | 先检查→够就 Simple、超了就压缩再生成 |
+| **Refine** | N 次 | ~N×2s | 极高 | 逐条迭代精炼，每条信息都被 LLM "咀嚼" |
+| **Tree Summarize** | N-1 次 | ~Ns | 中 | 自底向上分层归纳，适合总结类查询 |
+| **No Text** | 1 次 | ~0.5s | — | 纯 LLM 回答，不注入检索结果 |
+
+**按 Node 数量选择：**
+
+```
+1-3 个 Node → Simple（最快、最省钱、一次生成足够）
+4-8 个 Node → Compact（自适应——够就 Simple，超了就压缩）
+8+ 个 Node（总结类查询）→ Tree Summarize（分层归纳）
+2-5 个 Node（法律/医疗）→ Refine（不容出错，每条都要精炼）
+```
+
+**为什么生产环境推荐 Compact 作为默认——"自适应"：**
+
+```
+Compact 的设计哲学：像自动变速箱——低速用一档（Simple）、高速自动升档（压缩）。
+
+实际工作流：
+  ① 先尝试 Simple（直接把所有 Node 拼接）
+  ② 如果拼接后 token 数 ≤ LLM 上下文窗口 → 直接用 Simple（最快路径）
+  ③ 如果超过 → 对 Node 文本做摘要压缩 → 压缩后一次生成
+
+为什么比 Refine 更适合做默认：
+  → 大多数查询只有 3-5 个 Node 结果 → Simple 路径就够了（1 次 LLM 调用）
+  → 少数查询结果超限 → 自动切换到压缩模式（无需手动干预）
+  → Refine 对每个 Node 都做一次 LLM 调用 → N=5 时已经比 Compact 多 3-4 次调用
+  → Compact 不需要你判断"这个查询该用 Simple 还是 Refine"
+
+例外——什么时候 Compact 不适合：
+  → 法律/医疗场景 → 压缩可能丢失关键细节 → 用 Refine
+  → 总结类查询（"全文讲了什么"）→ Compact 不做分层归纳 → 用 Tree Summarize
+```
+
+**面试官追问："Refine 逐条迭代时，前面理解的错误会不会被带到后面？"**
+
+"会，这正是 Refine 的主要风险——错误累积。早期 Node 被误理解 → 形成了错误的已有回答 → 后续 Node 是在这个错误基础上迭代 → 错误被放大。
+
+缓解方法：
+1. 重要文档放在最前面（LLM 对先看到的信息更信任）
+2. 在 Prompt 中加入自我纠错指令：'如果新信息与已有结论矛盾，请明确指出'"
+---
+
+### 2.8.4 面试高频知识点速查
+
+#### 一句话答案系列
+
+| 问题 | 一句话答案 |
+|------|-----------|
+| as_retriever() 是什么？ | 工厂方法——根据 Index 类型自动选择 Retriever 子类，依赖注入组件，返回统一接口 |
+| 什么情况必须显式创建 Retriever？ | 需要 vector_store_query_mode="hybrid"、限定 node_ids、自定义 embed_model、高级参数控制 |
+| BM25 的 k1 控制什么？ | 词频饱和程度——k1 越大→多次出现加分越多；k1→0→出现与否的二元判断 |
+| BM25 的 b 控制什么？ | 长文档惩罚强度——b=1→强力惩罚、b=0→不惩罚 |
+| RRF 为什么是混合向量+BM25 的最佳选择？ | 不看原始分数、只看排名——天然解决向量分数[0,1]和BM25分数[0,∞)的量纲不可比问题 |
+| relative_score 融合什么时候用？ | 多路同类型检索器融合（都是余弦分数[0,1]）→ 归一化后加权有意义 |
+| Simple vs Compact 的区别？ | Simple=直接拼；Compact=先检查→够就Simple、超了就压缩→自适应 |
+| 什么时候用 Refine？ | 法律/医疗——每条信息都必须被 LLM 充分"咀嚼"，不能容忍信息丢失 |
+| Tree Summarize 适合什么？ | 总结类查询（"全文讲了什么"）、检索到 8+ 个 Node 时 |
+
+#### ResponseSynthesizer 策略速查表
+
+| 策略 | LLM调用 | 延迟基线 | 质量 | 最佳场景 | 不适用场景 |
+|------|:---:|:---:|:---:|------|------|
+| **Simple** | 1 | ~1s | ★★★ | 1-3 Node、快速原型 | 5+ Node（可能超上下文窗口） |
+| **Compact** | 1-2 | ~2s | ★★★★ | **生产环境默认**——自适应 | 法律/医疗（压缩丢细节） |
+| **Refine** | N | ~N×2s | ★★★★★ | 法律/医疗、2-5 Node、极致质量 | 延迟敏感、成本敏感 |
+| **Tree** | N-1 | ~N×1s | ★★★ | 8+ Node、总结类查询 | 简单事实查询、答案在 1 个 Node 中 |
+| **No Text** | 1 | ~0.5s | — | 测试基线、简单问候 | 需要检索结果支撑的回答 |
 
 ---
 

@@ -630,7 +630,600 @@ print("""
 
 ---
 
+## 二十、大厂面试题深度讲解
 
+### 20.1 Document 与 Node 核心概念类
+
+#### Q1：LlamaIndex 为什么需要 Document 和 Node 两层数据结构？直接用 Node 不行吗？（字节跳动 / 腾讯 高频）
+
+**面试官考察点：** 这道题考察对"为什么要设计两层抽象"的理解，而不是背概念。回答要触及设计哲学。
+
+**回答思路（从三个问题出发，逐步引出两层结构的必要性）：**
+
+**问题一：如果只有 Document，没有 Node——"粒度太粗"**
+
+```
+Document 《考勤管理制度》(5000 token, 10个话题)
+
+直接对 Document 做 Embedding → 一个向量编码了 10 个不同话题的语义
+→ 用户搜"事假申请"时，这个向量的相似度是：
+  "事假"(5%) + "年假"(5%) + "婚假"(5%) + "工作时间"(40%) + "考勤"(20%) + ...
+  = 高度稀释的语义信号
+
+→ 用户搜"事假申请"可能搜不到这篇文章，因为向量被其他话题"淹没"了。
+  Document 太大 → 语义不聚焦 → 检索精度差 → 必须切分为更细的单元
+```
+
+**问题二：如果只有 Node，没有 Document——"丢失了全局视角"**
+
+```
+Node[1]: "事假需提前1个工作日申请，经部门主管审批。"
+Node[2]: "病假应在当日8:30前通知部门主管。"
+Node[3]: "年假天数：入职1-5年5天。"
+
+没有 Document 时，这三个 Node 只是三个"孤立的文本片段"。
+你不知道：
+  - 它们都来自《考勤管理制度》——失去了"同一份文档"的全局关联
+  - 它们的 metadata 需要各自维护——如果作者从"人力资源部"改成"HR部门"，10 个 Node 要改 10 次
+  - 它们属于"人事政策"类别——无法在检索时按 category 统一过滤
+
+→ 没有 Document → metadata 管理成本爆炸 + 全局过滤不可行 + 溯源信息丢失
+```
+
+**问题三：两层结构解决了什么——"关注点分离"**
+
+```
+Document 层 → 负责"全局"：文档来源、元数据、版本、分类、全文
+  → 1 份文档的全局信息只存 1 次
+  → 修改 metadata 只需要改 Document
+
+Node 层 → 负责"局部"：语义片段、向量匹配、检索返回
+  → 每个 Node 编码一个集中的语义信号
+  → Node 自动从 Document 继承 metadata（不需要手动复制）
+  → Node 之间通过 Relationships 形成关系图
+
+两层结构的本质：把"全局管理"和"局部检索"解耦。
+```
+
+**面试官追问："这和 LangChain 的 Document 模型有什么本质区别？"**
+
+"LangChain 的 Document 是 `{page_content, metadata}`——它是一个扁平的袋子。切分后的 chunk 也是 Document 类型，chunk 之间没有任何关系。
+
+LlamaIndex 的 Document 是"父容器"——负责元数据的集中管理。切分后的 Node 是 Document 的"子单元"——继承了 metadata、建立了 SOURCE/PREVIOUS/NEXT/PARENT/CHILD 关系网。这个关系网是 SentenceWindowNodeParser、AutoMergingRetriever、递归检索等所有高级功能的数据基础。
+
+简单说：LangChain 的 Document 之间是孤岛，LlamaIndex 的 Node 之间是网络。"
 
 ---
+
+#### Q2：metadata 从 Document 到 Node 是如何继承的？为什么这个继承机制很重要？（阿里巴巴 / 百度）
+
+**面试官考察点：** 考察对 metadata 管理机制的细节理解。metadata 继承是生产系统可维护性的关键。
+
+**回答思路（先说机制，再说价值，最后说注意事项）：**
+
+**metadata 继承的机制：**
+
+```
+NodeParser.get_nodes_from_documents([doc]) 的内部逻辑：
+
+1. 切分 doc.text → ["chunk1文本", "chunk2文本", ...]
+
+2. 为每个 chunk 创建 Node：
+   for chunk_text in chunks:
+       node = Node(
+           text=chunk_text,
+           metadata=doc.metadata.copy(),  # ← 关键：浅拷贝 Document 的 metadata
+       )
+
+3. 建立 Relationship：
+   node.relationships[SOURCE] = doc.doc_id
+   node.relationships[PREVIOUS] = previous_node.node_id
+   node.relationships[NEXT] = next_node.node_id
+
+4. 可选：追加 Node 级别的 metadata
+   node.metadata["chunk_index"] = i
+   node.metadata["chunk_count"] = len(chunks)
+```
+
+**继承机制为什么重要——三个实战场景：**
+
+**场景一——一处修改，全局生效：**
+
+```
+没有继承机制 → 10 个 Node 各自维护 metadata
+  → Document 的 author 从 "人力资源部" 改为 "HR 管理中心"
+  → 需要遍历 10 个 Node，各自修改 metadata["author"]
+  → 极易遗漏，导致同一份文档的不同 chunk 有不同的 author
+
+有继承机制 → Document.metadata["author"] 更新
+  → 重新解析：node.metadata["author"] 自动更新
+  → 或通过 SOURCE 关系动态读取 Document 的最新 metadata
+  → 一处修改，全局一致
+```
+
+**场景二——按文档级属性做全局过滤：**
+
+```python
+# 用户问："HR 部门的 2024 年以后的新政策？"
+# → 需要同时用 category 和 created_date 过滤
+
+filters = MetadataFilters(filters=[
+    MetadataFilter(key="category", value="人事政策"),
+    MetadataFilter(key="created_date", value="2024-01-01", operator=">="),
+])
+
+# 如果没有 metadata 继承：
+#   → 每个 Node 都需要各自设置 category 和 created_date
+#   → 100 份 Document → 1000 个 Node → 1000 次手动设置 metadata
+#   → 几乎不可能在生产环境维护
+
+# 有 metadata 继承：
+#   → Document 级别设置一次 → 所有子 Node 自动携带
+#   → 过滤时每个 Node 都有 category 和 created_date → 直接可过滤
+```
+
+**场景三——溯源展示：**
+
+```
+LLM 回答后需要展示"该信息来自《考勤管理制度》V3.0（人力资源部，2024-03-15）"
+→ 这些信息全部来自 Node 继承的 Document metadata
+→ title + version + author + created_date → 前端展示的溯源卡片
+```
+
+**面试官追问："metadata 继承是用浅拷贝（shallow copy）还是深拷贝（deep copy）？这有什么影响？"**
+
+"LlamaIndex 用的是 `doc.metadata.copy()`——浅拷贝。这意味着：
+- 基础类型（str、int、date）的值被复制了，修改 Document 的 metadata 不会自动更新已生成的 Node → 这是合理的，因为已经入库的 Node 应该是快照
+- 如果 metadata 中有嵌套对象（list、dict），浅拷贝只拷贝引用，Document 修改嵌套对象的值会影响已生成的 Node → 这是个潜在坑，所以要避免在 metadata 中放可变对象
+
+最佳实践：只放基础类型（str/int/float/bool）在 metadata 中。如果需要嵌套结构，放在专门的字段中（如 `_raw`），并明确文档说明这是可变的。"
+
+---
+
+### 20.2 Node 关系类
+
+#### Q3：LlamaIndex 中 Node 的五种 Relationships 分别是什么？各自支持什么高级功能？（字节跳动 / 腾讯 高频）
+
+**面试官考察点：** 这是 LlamaIndex 的核心差异化特性。要讲清楚每种关系的"为什么存在"而非"是什么"。
+
+**回答框架（按从基础到高级的顺序讲）：**
+
+**关系一：SOURCE（Node → Document）—— 最基础，所有 Node 都有**
+
+```
+作用：溯源
+  Node[5] 被检索命中 → 通过 SOURCE 找到 Document[0]《考勤管理制度》
+  → 从 Document[0].metadata 获取 title/version/author
+  → 展示："来源：《考勤管理制度》V3.0"
+
+没有 SOURCE：你知道"这段文字说了什么"，不知道"它来自哪份文档"
+```
+
+**关系二+三：PREVIOUS / NEXT（Node ↔ Node）—— 上下文扩展**
+
+```
+作用：SentenceWindowNodeParser 自动上下文展开
+
+检索命中 Node[5] "病假应在当日8:30前通知部门主管"
+→ 自动展开：
+  PREVIOUS → Node[4] "事假需提前1个工作日申请"
+  NEXT     → Node[6] "婚假为3天"
+
+LLM 收到的不是孤立的 Node[5]，而是 Node[4]+Node[5]+Node[6] 的完整上下文
+→ 能理解"事假、病假、婚假"的并列关系和各自规则
+
+关键价值：解决"检索粒度"和"生成粒度"的矛盾
+  - 检索用小粒度 Node（200 token，匹配精准）
+  - 生成时通过 PREVIOUS/NEXT 自动扩展为 600 token 上下文
+  - 不需要手工管理 overlap！
+```
+
+**关系四+五：PARENT / CHILD（Node ↔ Node）—— 层级检索**
+
+```
+作用一：AutoMergingRetriever 自动合并
+  多个子 Node（如 Node[4], Node[5], Node[6]）都来自同一个父 Node
+  → 命中比例 > 50% → 自动合并为父 Node
+  → LLM 看到的是完整章节而非分散碎片
+
+作用二：MetadataReplacementPostProcessor
+  检索用子 Node（高精度）→ 返回时替换为父 Node（完整上下文）
+  → 子 Node 的 metadata 被父 Node 的 metadata 替换
+  → 用户看到的溯源信息是"该信息来自第二章 请假制度"而非"该信息来自第372段"
+
+作用三：递归检索（RecursiveRetriever）
+  Query 在第1层（章节级 Node）检索
+  → 命中 "第二章 请假制度"
+  → 通过 CHILD 关系下钻到第2层（段落级 Node）
+  → 在第2层做精确检索
+  → 找到最相关的具体条款
+```
+
+**五种关系的能力矩阵：**
+
+| 关系 | 支持的 LlamaIndex 功能 | 解决的问题 |
+|------|----------------------|-----------|
+| **SOURCE** | 溯源、metadata 过滤 | "这段信息来自哪？属于什么类别？" |
+| **PREVIOUS/NEXT** | SentenceWindowNodeParser | "检索到这段，但前后文是什么？" |
+| **PARENT/CHILD** | AutoMergingRetriever、MetadataReplacement、RecursiveRetriever | "这段属于哪个章节？如何获取完整上下文？" |
+
+**面试官追问："这些关系是存储在 Node 对象的哪个字段里？检索时会随 Node 一起返回吗？"**
+
+"关系存储在 `node.relationships` 字典中，是一个 `Dict[NodeRelationship, RelatedNodeInfo]` 类型。检索返回 `NodeWithScore` 时会携带 relationships。例如 `SentenceWindowNodeParser` 就是在检索结果返回后，遍历每个命中 Node 的 `relationships[PREVIOUS]` 和 `relationships[NEXT]`，递归获取前后的 Node 文本，拼接到最终返回的上下文中。这一操作发生在检索完成之后、LLM 生成之前。"
+
+---
+
+#### Q4：PREVIOUS/NEXT 和 PARENT/CHILD 都是 Node 间的关系，它们的本质区别是什么？什么时候用哪种？（阿里巴巴 / 美团）
+
+**面试官考察点：** 考察对两种关系维度的理解——横向 vs 纵向。
+
+**回答思路——关键的区分点在"关系维度"：**
+
+**维度一：一个是横向的"时间线"，一个是纵向的"层级树"**
+
+```
+PREVIOUS/NEXT = 横向的"链表"
+  
+  Node[0] ⇄ Node[1] ⇄ Node[2] ⇄ Node[3] ⇄ Node[4]
+  
+  关系维度：顺序关系。描述了"同一层级下，文本的先后顺序"。
+  类比：一本书翻页的"前一页/后一页"关系。
+
+PARENT/CHILD = 纵向的"树"
+  
+           Parent Node（章节标题）
+              │
+    ┌─────────┼─────────┐
+    │         │         │
+  Child[0]  Child[1]  Child[2]（具体条款）
+  
+  关系维度：层级关系。描述了"从概括到具体"的包含关系。
+  类比：书的"章/节/条"目录层级关系。
+```
+
+**维度二：使用场景完全不同**
+
+```
+PREVIOUS/NEXT 的使用场景：
+  → 你想让 LLM 看到"一段文字的上下文"
+  → 不改变检索的层级，只是横向扩展阅读范围
+  → 典型工具：SentenceWindowNodeParser
+  → 问自己："LLM 读这一段时，需要看它前后说了什么吗？"
+
+PARENT/CHILD 的使用场景：
+  → 你想从"模糊的章节标题"定位到"精确的条款内容"
+  → 改变检索的层级——从上到下或从下到上
+  → 典型工具：AutoMergingRetriever、RecursiveRetriever
+  → 问自己："检索到了章节标题，需要下钻到具体条款吗？"
+        或 "检索到了太多碎片，能合并为完整章节吗？"
+```
+
+**维度三：一个具体的比较案例**
+
+```
+场景：知识库有 1000 个 Node，用户问"请假有哪些类型？"
+
+方案 A（只用 PREVIOUS/NEXT，不用 PARENT/CHILD）：
+  ① 检索 Node 层面 → 命中 Node[200] "第二章 请假制度 第三条 事假..."
+  ② 通过 PREVIOUS 向前展开 2 个 Node → 多拿到一些上下文
+  ③ 通过 NEXT 向后展开 2 个 Node → 多拿到一些上下文
+  ④ LLM 看到了约 5 个相邻 Node，可能覆盖了 3 种请假类型
+  → 问题：如果请假类型分布在 10 个相邻 Node 之间，窗口不够大就会漏
+
+方案 B（使用 PARENT/CHILD 层级结构）：
+  ① Level 1（章节 Node）检索 → "第二章 请假制度" = 父 Node
+  ② 通过 CHILD 关系直接获取该章下所有子 Node
+  ③ LLM 看到了"第二章"的全部内容 → 所有请假类型 100% 覆盖
+  → 优势：不需要猜测"窗口要拉多大"，层级关系本身定义了边界
+```
+
+**选择决策：**
+
+```
+用 PREVIOUS/NEXT 当：
+  ✓ 文档没有明确的层级结构（纯文本）
+  ✓ 需要的是"局部连贯性"而非"全局完整性"
+  ✓ 不确定需要多少上下文，希望灵活调整窗口大小
+
+用 PARENT/CHILD 当：
+  ✓ 文档有明确的层级结构（Markdown 标题、法律条款、教科书）
+  ✓ 需要的是"章节级别的完整性"
+  ✓ 希望检索后自动合并为"完整的逻辑单元"
+
+两者不互斥——可以同时使用：
+  SentenceWindowNodeParser（PREVIOUS/NEXT 横向扩展）
+  + MetadataReplacementPostProcessor（PARENT/CHILD 纵向替换）
+  = 先用层级定位到正确的章节，再用窗口扩展保证局部连贯
+```
+
+---
+
+### 20.3 索引与检索机制类
+
+#### Q5：为什么 LlamaIndex 的 Index 建在 Node 上而不是 Document 上？如果直接对 Document 做 Embedding 会怎样？（腾讯 / 百度）
+
+**面试官考察点：** 是否理解"为什么必须先切分再索引"的底层原因。这是 RAG 的基石认知。
+
+**回答思路（用数值对比讲清楚语义稀释效应）：**
+
+**直接对 Document 做 Embedding——语义稀释效应：**
+
+```
+假设一个 Document 包含 5 个不同的话题：
+  Document.text = 
+    "第一章 工作时间（500字符）...
+     第二章 请假制度（600字符）...
+     第三章 考勤管理（400字符）...
+     第四章 薪酬福利（800字符）...
+     第五章 培训发展（300字符）..."
+
+总长度：2600 字符 ≈ 1200 token
+
+Embedding 后生成的向量：
+  = 平均池化(第一章的语义 + 第二章的语义 + ... + 第五章的语义)
+  = 一个"什么都有、什么都不精准"的向量
+
+检索时：
+  用户问精确问题 "事假提前几天申请？"
+  
+  Document 向量 vs Query 向量 → 相似度 0.52
+  → 因为 Document 向量中，"事假"的语义权重只有约 12%（1/5 个章节 + 大部分内容在讲工作时间/薪酬/培训）
+  
+  Node 向量（来自 "第三条 事假需提前1个工作日申请"） vs Query 向量 → 相似度 0.91
+  → Node 向量中，"事假"是核心语义，权重占 80%+
+  
+  差距：0.91 vs 0.52 → 如果 Top-K=5，Document 级别的检索可能根本排不进前 5
+```
+
+**用向量空间的视角理解：**
+
+```
+文档 → Embedding：
+  
+  文档 A 的向量：位于向量空间中"人事政策"、"工作时间"、"薪酬"、"培训"、"考勤"的几何中心
+  → 它不和任何一个具体话题接近，它是所有话题的"平均值"
+  
+  文档 B 的向量：位于"财务报销"、"差旅标准"、"审批流程"的几何中心
+  
+  用户 query "事假申请" 的向量：位于"请假制度"附近
+  
+  距离对比：
+    query ↔ Node[事假段落] = 很近（语义匹配）→ 相似度 0.91
+    query ↔ Document A = 中等距离 → 相似度 0.52
+    query ↔ Document B = 很远 → 相似度 0.31
+    
+  如果 Top-K=3，排序是：Node[事假] > Document A > Document B
+  → Node 排第一 ✓
+  
+  如果 Top-K=3 且只用 Document（没有 Node）：Document A > Document B > 其他不相关文档
+  → 虽然 A 排第一，但相似度只有 0.52，LLM 收到的是一份 2600 字符的全文
+  → 其中只有 600 字符（23%）是相关的，其余是噪声
+
+  如果检索返回多个 Document（Top-K=5），5 个 Document 加起来可能 10000+ token
+  → 大量 token 浪费在"看起来有点相关其实不相关"的内容上
+```
+
+**面试官追问："那如果我的文档很短（< 500 token），还需要切分吗？"**
+
+"不需要。切分的目的是解决"文档太大导致语义稀释"。如果文档本身就是一个短 FAQ、一条聊天记录、一条法律条款——它自身就是一个完美的语义单元，切分反而可能破坏它的完整性。LlamaIndex 的 NodeParser 也不会对短文本做无意义的切分——`SentenceSplitter` 会在文本长度 < chunk_size 时保持原样。所以正确的说法是：**对语义完整的短文档不做切分，对语义混杂的长文档必须切分。判断标准不是文档数量，而是单个文档的话题集中度。**"
+
+---
+
+### 20.4 实战与调试类
+
+#### Q6：HierarchicalNodeParser 和 SentenceWindowNodeParser 有什么区别？分别在什么场景下使用？（美团 / 拼多多）
+
+**面试官考察点：** 是否理解这两种 Parser 的定位差异——一个做层级、一个做窗口。
+
+**回答思路（先各自讲清原理，再对比，最后给选择建议）：**
+
+**HierarchicalNodeParser——"组织知识的树形结构"：**
+
+```
+工作原理：
+  Input: Document
+  → 第一轮切分：chunk_size=512 → 产生"章节级 Node"（Level 1）
+  → 第二轮切分：对每个 Level 1 Node 内部用 chunk_size=200 再切 → 产生"段落级 Node"（Level 2）
+  
+  结果：
+    Level 1 Node[0] = "第二章 请假制度\n第三条 事假需提前..." (512t)
+      ├─ PARENT/CHILD 关系
+      ├─ Level 2 Node[0-0] = "第三条 事假需提前1个工作日申请" (200t)
+      ├─ Level 2 Node[0-1] = "第四条 病假应在8:30前通知主管" (200t)
+      └─ Level 2 Node[0-2] = "第五条 年假天数：入职1-5年5天" (200t)
+  
+  检索策略：
+    先在 Level 2（小 Node）检索 → 命中 Node[0-1]
+    → 通过 PARENT 关系获取 Level 1 Node[0]
+    → 将 Level 1 Node[0]（完整章节）作为上下文注入 LLM
+  
+  核心思想：用层级结构保证章节级完整性
+```
+
+**SentenceWindowNodeParser——"给每个片段加个窗"：**
+
+```
+工作原理：
+  Input: Document
+  → 按句子边界切分为最小粒度的 Node（每 1-2 句一个 Node）
+  
+  结果：
+    Node[0] = "第一章 工作时间" (单句)
+    Node[1] = "第一条 公司实行标准工时制，每日工作不超过8小时。" (单句)
+    Node[2] = "第二条 上班时间为上午9:00至下午18:00。" (单句)
+    Node[3] = "第二章 请假制度" (单句)
+    Node[4] = "第三条 事假需提前1个工作日申请，经部门主管审批。" (单句)
+    Node[5] = "第四条 病假应在当日8:30前通知部门主管。" (单句)
+    ...
+    （所有 Node 之间有 PREVIOUS/NEXT 关系）
+  
+  检索策略：
+    检索命中 Node[4] "事假需提前..."
+    → 通过 PREVIOUS 取 Node[3], Node[2], Node[1]
+    → 通过 NEXT 取 Node[5], Node[6], Node[7]
+    → 将 Node[1]~Node[7] 拼接为 7 个句子的窗口 → 注入 LLM
+  
+  核心思想：用滑动窗口保证上下文连贯性
+```
+
+**核心区别对比：**
+
+| 维度 | HierarchicalNodeParser | SentenceWindowNodeParser |
+|------|------------------------|--------------------------|
+| **切分层数** | 2 层（章节级 + 段落级） | 1 层（句子级） |
+| **关系类型** | 使用 PARENT/CHILD | 使用 PREVIOUS/NEXT |
+| **上下文获取方式** | 纵向：子 Node → 父 Node | 横向：命中 Node → 前后 N 个 Node |
+| **上下文边界** | 由文档的层级结构决定（章节边界） | 由窗口大小参数决定（固定 N 个句子） |
+| **适用文档** | 有明确层级结构（Markdown/法律/教科书） | 无明确结构（散文/聊天记录/纯文本） |
+| **上下文完整度** | 保证章节级完整 | 取决于窗口大小+文档特征 |
+| **灵活性** | 低（层级结构固定） | 高（窗口大小可调） |
+
+**选择建议：**
+
+```
+用 HierarchicalNodeParser 当：
+  ✓ 文档有 # ## ### 标题层级
+  ✓ 法律条文有"第X章 第X条"结构
+  ✓ 教科书/手册的章节结构清晰
+  → 好处：PARENT/CHILD 关系天然定义了"完整语义单元"的边界
+           不需要猜测"窗口该拉多大"
+
+用 SentenceWindowNodeParser 当：
+  ✓ 文档没有明确层级（散文、聊天记录、非结构化 PDF）
+  ✓ 需要灵活控制上下文窗口大小
+  ✓ 追求最高检索精度（句子级粒度）
+  → 好处：检索时用单句（最高精度），生成时展开为窗口（保证上下文）
+```
+
+---
+
+#### Q7：用 LlamaIndex 的 metadata filter 做检索过滤时，底层是怎么工作的？有什么坑？（字节跳动 / 华为）
+
+**面试官考察点：** metadata 过滤是生产环境的刚需。考察是否理解过滤的底层机制和性能影响。
+
+**回答思路（先讲原理，再讲坑）：**
+
+**metadata filter 的底层工作流：**
+
+```
+用户设置 filters：
+  MetadataFilters(filters=[
+      MetadataFilter(key="category", value="人事政策"),
+      MetadataFilter(key="created_date", value="2024-01-01", operator=">="),
+  ])
+
+实际执行（取决于向量数据库）：
+
+方案 A：前置过滤（Pre-filtering）
+  ① 先用 metadata 条件过滤所有 Node → 候选集从 10000 缩到 500
+  ② 在 500 个候选 Node 中做向量检索 → Top-5
+  优点：检索范围缩小，精度更高
+  缺点：如果过滤后候选太少（< Top-K），可能漏掉相关内容
+
+方案 B：后置过滤（Post-filtering）
+  ① 先做向量检索 → 从 10000 中取 Top-100
+  ② 在 Top-100 中按 metadata 过滤 → 得到符合条件的 Top-5
+  优点：不会因为过滤条件太严而漏召回
+  缺点：如果过滤条件过滤掉了 Top-100 中的大部分内容，实际返回可能 < 5
+
+方案 C：混合过滤（推荐）
+  ① 向量检索 + metadata 过滤同时进行（支持向量索引+标量索引的库）
+  → Milvus/Qdrant/Weaviate 原生支持
+  → 速度快 + 精度高
+```
+
+**四个常见坑：**
+
+**坑一——metadata 字段不是索引字段，过滤会退化为全表扫描：**
+
+```
+问题：metadata 中的 "department" 字段没有建标量索引
+→ 向量数据库做过滤时需要遍历所有 Node 的 metadata
+→ 100 万 Node → 全表扫描 → 延迟从 10ms 飙升到 500ms+
+
+解决：确保常用过滤字段在向量数据库中建了标量索引
+  Qdrant: payload 中的 indexed 字段
+  Milvus: schema 中的 scalar index
+  Weaviate: 自动为所有属性建倒排索引
+```
+
+**坑二——metadata 类型不一致导致过滤失败：**
+
+```
+问题：Document 的 metadata["created_date"] = "2024-03-15"（字符串）
+      过滤条件 operator=">=" 要求数值或日期类型
+      → 字符串比较 "2024-03-15" >= "2024-01-01" 虽然碰巧能工作，
+        但 "2024-11-01" >= "2024-01-01" 也是 True（字符串的字典序不一定等于日期序）
+      → 更糟的是跨年时："2025-01-01" >= "2024-12-31" = False（字符串比较）
+
+解决：存储日期时用 ISO 8601 格式 "2024-03-15"
+      或转为 Unix timestamp（整数），过滤时用数值比较
+```
+
+**坑三——过滤后结果为空时的兜底缺失：**
+
+```
+问题：用户问 "2025 年的新政策有哪些？"
+      filters: created_date >= 2025-01-01
+      但知识库中还没有 2025 年的文档 → 过滤后候选集为空
+      → 返回空结果 → 用户看到 "未找到相关信息"
+      → 但可能知识库中有 2024 年底的"即将生效的 2025 年政策"
+
+解决：过滤条件分级
+  第一级：严格过滤（category=人事政策 AND created_date>=2025）
+  第二级（兜底）：放宽过滤（category=人事政策，按 created_date 倒序）
+  在 Prompt 中明确告诉 LLM："以下是最接近的信息（日期不完全匹配），请据此作答"
+```
+
+**坑四——metadata 字段太多，手动设置成本高且易出错：**
+
+```
+问题：团队有 3 个人在维护 Document metadata
+  → A 用 "create_date"，B 用 "created_at"，C 用 "date"
+  → 过滤时不知道该用哪个字段名
+
+解决：约定 metadata schema（类似数据库 schema）
+  {
+    "source": str,      # 文档来源（必填）
+    "title": str,       # 文档标题（必填）
+    "category": str,    # 分类标签（必填，从枚举中选）
+    "created_date": str, # ISO 8601 格式（必填）
+    "version": str,     # 版本号（选填）
+    "department": str,  # 部门（选填）
+  }
+  → 在代码中用 Pydantic/ dataclass 校验 metadata 结构
+  → CI 中检查是否有非标准字段
+```
+
+---
+
+### 20.5 面试高频知识点速查
+
+#### 一句话答案系列
+
+| 问题 | 一句话答案 |
+|------|-----------|
+| Document 和 Node 的关系？ | Document 是"父容器"（管理全局元数据），Node 是"子单元"（索引和检索的最小粒度），1 个 Document → N 个 Node |
+| 为什么 Index 建在 Node 上？ | Node 粒度小、话题聚焦，向量语义信号强；Document 太大，语义被稀释，检索精度差 |
+| metadata 如何从 Document 到 Node？ | NodeParser 创建 Node 时 `node.metadata = doc.metadata.copy()`（浅拷贝），自动继承 |
+| 五种 Relationships 分别解决什么？ | SOURCE=溯源、PREVIOUS/NEXT=上下文扩展、PARENT/CHILD=层级检索 |
+| PREVIOUS/NEXT 的最佳应用？ | SentenceWindowNodeParser——检索命中后自动展开前后 N 个句子的上下文窗口 |
+| PARENT/CHILD 的最佳应用？ | AutoMergingRetriever——子节点命中比例 > 阈值时自动合并为父节点 |
+| HierarchicalNodeParser 怎么用？ | 文档有 `#`/`##` 层级结构时，先切章节级大块再切段落级小块，用 PARENT/CHILD 做层级检索 |
+| metadata filter 的坑？ | 字段没建标量索引 → 全表扫描；类型不一致 → 过滤条件失效；结果为空 → 缺兜底策略 |
+
+#### 必知数据结构速查
+
+| 概念 | LlamaIndex 实现 | LangChain 实现 |
+|------|----------------|---------------|
+| **文档层** | `Document(text, metadata)` — 父容器 | `Document(page_content, metadata)` — 扁平结构 |
+| **检索单元** | `Node(text, metadata, relationships)` — 有向关系图 | `Document` — 切分后的 chunk 也是 Document，无关系 |
+| **元数据继承** | 自动：`Node.metadata = doc.metadata.copy()` | 手动：需在切分逻辑中自己实现 |
+| **节点关系** | `SOURCE/PREVIOUS/NEXT/PARENT/CHILD` 五种关系 | 无内置关系，需自行维护 |
+| **关系使用** | SentenceWindow/AutoMerging/RecursiveRetriever | 无对应功能 |
+| **层级切分** | `HierarchicalNodeParser` 原生支持 | 需手动实现 |
+
+---
+
+
 
