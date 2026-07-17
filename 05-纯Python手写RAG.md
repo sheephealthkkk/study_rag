@@ -312,7 +312,7 @@ split_text() 的执行流程：
 输出: List[Document]（每个 chunk 附带了 chunk_index 和 chunk_count）
 ```
 
-#### 12.5.2 字符数 vs Token 数
+#### 12.5.2 字符数 vs Token 数:o::o::o:
 
 ```
 ⚠️ 常踩的坑：chunk_size=512（字符）≠ 512 tokens！

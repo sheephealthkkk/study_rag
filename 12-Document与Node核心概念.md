@@ -136,7 +136,7 @@ for node in nodes:
     print(node.metadata["author"])    # "人力资源部" —— 继承自 Document
 ```
 
-#### 19.3.3 Document 元数据的实战价值
+#### 19.3.3 Document 元数据的实战价值:o:
 
 ```
   Document metadata 的应用场景：
@@ -190,7 +190,7 @@ for node in nodes:
 
 #### 19.4.2 Node 是灵活的关键
 
-Node 的设计赋予了 LlamaIndex 远超简单向量检索的能力：
+Node 的设计赋予了 LlamaIndex 远超简单向量检索的能力：:o::o::o::o::o::o:
 
 ```
   Node 的灵活性体现在三个层面：
@@ -212,7 +212,7 @@ Node 的设计赋予了 LlamaIndex 远超简单向量检索的能力：
 
 ---
 
-### 19.5 Node 之间的关系 (Relationships)
+### 19.5 Node 之间的关系 (Relationships):o::o::o:
 
 这是 LlamaIndex 区别于 LangChain 纯 Document 模型的核心特性。Node 之间可以建立多种类型的关系，形成一个**有向关系图**：
 
@@ -262,7 +262,7 @@ Node 的设计赋予了 LlamaIndex 远超简单向量检索的能力：
 | **SOURCE** | Node → Document | 表示这个 Node 来源于哪个 Document。是所有 Node 都必须有的关系。 | `SOURCE: Document[0]` | 溯源：LLM 回答后展示"该信息来自《员工手册》"；metadata 继承：从 SOURCE Document 获取全局元数据 |
 | **PREVIOUS** | Node → Node | 表示同一 Document 内，这个 Node 的前一个兄弟 Node | `PREVIOUS: Node[1-1]` | 上下文展开：检索到 Node[1-2] 后，通过 PREVIOUS 获取前文 → 补充 LLM 上下文；SentenceWindow 自动展开 |
 | **NEXT** | Node → Node | 表示同一 Document 内，这个 Node 的后一个兄弟 Node | `NEXT: Node[1-3]` | 与 PREVIOUS 配对使用。检索到中间 Node 时，前后各取 N 个 Node 组成完整上下文窗口 |
-| **PARENT** | Node → Node | 表示这个 Node 的父级 Node（通常是章节标题） | `PARENT: Node[1]` | 层级理解：检索到"第三条..."时，知道它的父标题是"第二章 请假制度"；递归检索：从小 Node 追溯到大 Node 获取更完整上下文；MetadataReplacement：用小 Node 检索、用父 Node 做上下文 |
+| **PARENT** | Node → Node:o: | 表示这个 Node 的父级 Node（通常是章节标题） | `PARENT: Node[1]` | 层级理解：检索到"第三条..."时，知道它的父标题是"第二章 请假制度"；递归检索：从小 Node 追溯到大 Node 获取更完整上下文；MetadataReplacement：用小 Node 检索、用父 Node 做上下文 |
 | **CHILD** | Node → Node | 表示这个 Node 的子级 Node。PARENT 的反向关系。 | `CHILD: [Node[1-1], Node[1-2]]` | 层级索引：从章节 Node 下钻到具体的段落 Node |
 
 #### 19.5.2 各关系的具体使用场景
@@ -799,7 +799,7 @@ LLM 回答后需要展示"该信息来自《考勤管理制度》V3.0（人力�
 没有 SOURCE：你知道"这段文字说了什么"，不知道"它来自哪份文档"
 ```
 
-**关系二+三：PREVIOUS / NEXT（Node ↔ Node）—— 上下文扩展**
+**关系二+三：PREVIOUS / NEXT（Node ↔ Node）—— 上下文扩展**:o:
 
 ```
 作用：SentenceWindowNodeParser 自动上下文展开
@@ -818,7 +818,7 @@ LLM 收到的不是孤立的 Node[5]，而是 Node[4]+Node[5]+Node[6] 的完整�
   - 不需要手工管理 overlap！
 ```
 
-**关系四+五：PARENT / CHILD（Node ↔ Node）—— 层级检索**
+**关系四+五：PARENT / CHILD（Node ↔ Node）—— 层级检索**:o:
 
 ```
 作用一：AutoMergingRetriever 自动合并
@@ -1097,7 +1097,7 @@ Embedding 后生成的向量：
 
 ---
 
-#### Q7：用 LlamaIndex 的 metadata filter 做检索过滤时，底层是怎么工作的？有什么坑？（字节跳动 / 华为）
+#### Q7：用 LlamaIndex 的 metadata filter 做检索过滤时，底层是怎么工作的？有什么坑？（字节跳动 / 华为）:o::o::O::O:o::o::o:
 
 **面试官考察点：** metadata 过滤是生产环境的刚需。考察是否理解过滤的底层机制和性能影响。
 
@@ -1134,7 +1134,7 @@ Embedding 后生成的向量：
 
 **四个常见坑：**
 
-**坑一——metadata 字段不是索引字段，过滤会退化为全表扫描：**
+**坑一——metadata 字段不是索引字段，过滤会退化为全表扫描：**:o:
 
 ```
 问题：metadata 中的 "department" 字段没有建标量索引
