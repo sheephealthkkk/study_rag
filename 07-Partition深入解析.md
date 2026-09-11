@@ -30,9 +30,9 @@ for el in elements:
 
 ---
 
-### 14.2 partition 通用参数详解
+### 14.2 partition :o:通用参数详解
 
-`partition()` 是 Unstructured 的顶层入口，它的参数可以归为 **六大类**：
+`partition()` 是 Unstructured 的顶层入口，它的参数可以归为 **六大类**：:o::o::o::o:输入源参数,核心处理策略, 语言参数, 表格与图片参数, 页面与分块控制参数, 元数据控制参数
 
 #### 14.2.1 输入源参数 —— 你要处理什么
 
